@@ -1,111 +1,100 @@
-const DEFAULT_URLS = [
-  "wss://quick-ferret-74.deno.dev"
-];
-
 export class WebRTCClient {
-  constructor(id, onMessage, urls) {
-    this.id = id;
-    this.urls = urls || [...DEFAULT_URLS];
+  constructor(myId, onMessage, urls) {
+    this.myId = myId;
+    this.urls = urls || [
+      "wss://quick-ferret-74.deno.dev",
+      // add backup URLs here
+    ];
     this.onMessage = onMessage;
-    this.peer = new RTCPeerConnection();
-    this.channel = this.peer.createDataChannel("chat");
-    this.socket = null;
-
-    this.channel.onmessage = e => onMessage?.(e.data);
-    this.init();
+    this.mediaStream = null;
+    this.ws = null;
+    this.pc = null;
+    this.dc = null;
+    this._connect();
   }
 
-  addUrl(url) {
-    this.urls.push(url);
-  }
-
-  setUrls(urls) {
-    this.urls = urls;
-  }
-
-  async init() {
-    for (const url of this.urls) {
+  async _connect() {
+    for (let url of this.urls) {
       try {
-        this.socket = new WebSocket(`${url}/ws`);
-        this.socket.onopen = () => {
-          console.log("[OK] Connected:", url);
-          this.socket.send(JSON.stringify({ action: "register", id: this.id }));
-        };
-        this.socket.onmessage = async (event) => {
-          const msg = JSON.parse(event.data);
-          if (msg.action === "receive") {
-            const sdp = JSON.parse(await this.decompress(msg.data));
-            await this.handleRemote(sdp, msg.from);
+        this.ws = new WebSocket(url);
+        this.ws.onmessage = async (e) => {
+          const data = JSON.parse(e.data);
+          if (this.myId in data) {
+            await this._acceptOffer(data[this.myId]);
           }
         };
-        break;
-      } catch (err) {
-        console.warn("[WARN] Failed:", url, err);
+        return;
+      } catch (e) {
+        console.warn("Failed to connect to:", url);
       }
     }
+    throw new Error("No available signaling servers.");
+  }
 
-    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    stream.getTracks().forEach(t => this.peer.addTrack(t, stream));
-    const local = document.querySelector("#local");
-    if (local) local.srcObject = stream;
+  async _acceptOffer(offer) {
+    this.pc = new RTCPeerConnection();
 
-    this.peer.ontrack = ({ streams }) => {
-      const remote = document.querySelector("#remote");
-      if (remote) remote.srcObject = streams[0];
+    this.pc.ondatachannel = (event) => {
+      this.dc = event.channel;
+      this.dc.onmessage = (e) => this.onMessage?.(e.data);
     };
+
+    this.pc.ontrack = (event) => {
+      if (!this.remoteStream) {
+        this.remoteStream = new MediaStream();
+        if (this.onRemoteStream) {
+          this.onRemoteStream(this.remoteStream);
+        }
+      }
+      this.remoteStream.addTrack(event.track);
+    };
+
+    await this.pc.setRemoteDescription(offer);
+    const answer = await this.pc.createAnswer();
+    await this.pc.setLocalDescription(answer);
+    this.ws.send(JSON.stringify({ [this.myId]: this.pc.localDescription }));
   }
 
-  async call(target) {
-    this.target = target;
-    const offer = await this.peer.createOffer();
-    await this.peer.setLocalDescription(offer);
-    const compressed = await this.compress(JSON.stringify(offer));
-    this.send(target, compressed);
-  }
+  async call(targetId, useMedia = false) {
+    this.pc = new RTCPeerConnection();
 
-  async handleRemote(sdp, from) {
-    const desc = new RTCSessionDescription(sdp);
-    if (desc.type === "offer") {
-      await this.peer.setRemoteDescription(desc);
-      const answer = await this.peer.createAnswer();
-      await this.peer.setLocalDescription(answer);
-      const compressed = await this.compress(JSON.stringify(answer));
-      this.send(from, compressed);
-    } else if (desc.type === "answer") {
-      await this.peer.setRemoteDescription(desc);
+    if (useMedia) {
+      try {
+        this.mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: true,
+        });
+        this.mediaStream.getTracks().forEach((track) => {
+          this.pc.addTrack(track, this.mediaStream);
+        });
+      } catch (err) {
+        console.error("Media permission denied or error:", err);
+        return;
+      }
+    } else {
+      this.dc = this.pc.createDataChannel("chat");
+      this.dc.onmessage = (e) => this.onMessage?.(e.data);
     }
+
+    await this.pc.setLocalDescription(await this.pc.createOffer());
+    this.ws.send(JSON.stringify({ [targetId]: this.pc.localDescription }));
   }
 
   sendMessage(msg) {
-    if (this.channel) this.channel.send(msg);
+    if (this.dc && this.dc.readyState === "open") {
+      this.dc.send(msg);
+    }
   }
 
-  send(target, data) {
-    this.socket.send(JSON.stringify({
-      action: "send",
-      from: this.id,
-      target,
-      data
-    }));
+  onRemoteStream(callback) {
+    this.onRemoteStream = callback;
   }
 
-  async compress(str) {
-    const cs = new CompressionStream("deflate");
-    const writer = cs.writable.getWriter();
-    writer.write(new TextEncoder().encode(str));
-    writer.close();
-    const buf = await new Response(cs.readable).arrayBuffer();
-    return btoa(String.fromCharCode(...new Uint8Array(buf)));
+  getLocalMediaStream() {
+    return this.mediaStream || null;
   }
 
-  async decompress(base64) {
-    const binary = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
-    const ds = new DecompressionStream("deflate");
-    const writer = ds.writable.getWriter();
-    writer.write(binary);
-    writer.close();
-    const buf = await new Response(ds.readable).arrayBuffer();
-    return new TextDecoder().decode(buf);
+  getRemoteMediaStream() {
+    return this.remoteStream || null;
   }
 }
-

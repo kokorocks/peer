@@ -2,7 +2,7 @@ import asyncio
 import aiohttp
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
 
-class WebRTCClient:
+class peer:
     def __init__(self, my_id, target_id, urls=None):
         self.my_id = my_id
         self.target_id = target_id
