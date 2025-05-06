@@ -1,0 +1,12 @@
+<script type="module">
+    import { WebRTCClient } from 'https://cdn.jsdelivr.net/gh/kokorocks/peer/main.js';
+  
+    const client = new WebRTCClient("alice", msg => console.log("[bob]:", msg));
+  
+    setTimeout(() => client.call("bob"), 1000); // No media → no permission prompt
+  
+    document.querySelector("#send").onclick = () => {
+      client.sendMessage(document.querySelector("#msg").value);
+    };
+  </script>
+  
