@@ -1,103 +1,77 @@
-import asyncio, json, base64, zlib, websockets
-from aiortc import RTCPeerConnection, RTCSessionDescription
-from aiortc.contrib.media import MediaPlayer, MediaRecorder
-
-DEFAULT_URLS = [
-    "wss://quick-ferret-74.deno.dev/ws"
-]
+import asyncio
+import aiohttp
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
 
 class WebRTCClient:
-    def __init__(self, id, target, urls=None, use_av=True):
-        self.id = id
-        self.target = target
-        self.urls = urls or DEFAULT_URLS
-        self.use_av = use_av
-        self.ws = None
+    def __init__(self, my_id, target_id, urls=None):
+        self.my_id = my_id
+        self.target_id = target_id
+        self.urls = urls or [
+            "wss://quick-ferret-74.deno.dev",
+            # add more failover URLs here
+        ]
         self.pc = RTCPeerConnection()
-        self.channel = None
-        self.player = None
-        self.recorder = None
+        self.dc = None
+        self.ws = None
+        self.video_audio_enabled = False
 
-    def add_url(self, url):
-        self.urls.append(url)
-
-    def set_urls(self, urls):
-        self.urls = urls
-
-    async def connect(self):
+    async def _connect_signaling(self):
         for url in self.urls:
             try:
-                self.ws = await websockets.connect(url)
-                await self.ws.send(json.dumps({"action": "register", "id": self.id}))
-                print(f"[OK] Connected to {url}")
-                break
-            except Exception as e:
-                print(f"[WARN] Failed to connect to {url}: {e}")
-        else:
-            raise Exception("No signaling servers available")
+                session = aiohttp.ClientSession()
+                self.ws = await session.ws_connect(url)
+                return
+            except:
+                continue
+        raise Exception("Could not connect to any signaling server.")
 
-        if self.use_av:
-            await self.setup_media()
+    async def connect(self):
+        await self._connect_signaling()
 
-        asyncio.create_task(self._listen())
+        @self.pc.on("datachannel")
+        def on_datachannel(channel):
+            self.dc = channel
+            self.dc.on("message", lambda msg: print(f"[{self.target_id}] {msg}"))
 
-    async def setup_media(self):
-        self.player = MediaPlayer("default", format="pulse")
-        if self.player.audio:
-            self.pc.addTrack(self.player.audio)
-        if self.player.video:
-            self.pc.addTrack(self.player.video)
-        self.recorder = MediaRecorder("output.mp4")
-        await self.recorder.start()
-
-        @self.pc.on("track")
-        async def on_track(track):
-            await self.recorder.addTrack(track)
-
-        self.channel = self.pc.createDataChannel("chat")
-
-        @self.channel.on("message")
-        def on_message(msg):
-            print("[DATA]", msg)
+        # Poll for offers
+        async def poll():
+            while True:
+                await self.ws.send_json({"id": self.my_id})
+                msg = await self.ws.receive_json()
+                if self.target_id in msg:
+                    await self.pc.setRemoteDescription(RTCSessionDescription(
+                        msg[self.target_id]["sdp"], msg[self.target_id]["type"]))
+                    answer = await self.pc.createAnswer()
+                    await self.pc.setLocalDescription(answer)
+                    await self.ws.send_json({self.my_id: {
+                        "sdp": self.pc.localDescription.sdp,
+                        "type": self.pc.localDescription.type
+                    }})
+                    break
+                await asyncio.sleep(1)
+        asyncio.create_task(poll())
 
     async def call(self):
-        offer = await self.pc.createOffer()
-        await self.pc.setLocalDescription(offer)
-        await self.send_sdp(self.target, self.pc.localDescription)
+        self.dc = self.pc.createDataChannel("chat")
+        await self.pc.setLocalDescription(await self.pc.createOffer())
+        await self.ws.send_json({self.target_id: {
+            "sdp": self.pc.localDescription.sdp,
+            "type": self.pc.localDescription.type
+        }})
 
-    async def send_sdp(self, to, desc):
-        compressed = base64.b64encode(zlib.compress(json.dumps({
-            "sdp": desc.sdp,
-            "type": desc.type
-        }).encode())).decode()
+    def send_message(self, text):
+        if self.dc:
+            self.dc.send(text)
 
-        await self.ws.send(json.dumps({
-            "action": "send",
-            "from": self.id,
-            "target": to,
-            "data": compressed
-        }))
+    async def enable_video_audio(self):
+        self.video_audio_enabled = True
+        try:
+            from aiortc.contrib.media import MediaPlayer
+        except ImportError:
+            raise RuntimeError("Install 'aiortc' and 'av' to enable video/audio.")
 
-    async def _listen(self):
-        async for msg in self.ws:
-            m = json.loads(msg)
-            if m["action"] != "receive":
-                continue
-            decoded = json.loads(zlib.decompress(base64.b64decode(m["data"])).decode())
-            sdp = RTCSessionDescription(decoded["sdp"], decoded["type"])
-            if sdp.type == "offer":
-                await self.pc.setRemoteDescription(sdp)
-                answer = await self.pc.createAnswer()
-                await self.pc.setLocalDescription(answer)
-                await self.send_sdp(m["from"], self.pc.localDescription)
-            elif sdp.type == "answer":
-                await self.pc.setRemoteDescription(sdp)
-
-    def send_message(self, msg):
-        if self.channel:
-            self.channel.send(msg)
-
-    async def close(self):
-        if self.recorder: await self.recorder.stop()
-        await self.pc.close()
-        if self.ws: await self.ws.close()
+        player = MediaPlayer("/dev/video0", format="v4l2", options={"video_size": "640x480"})
+        if player.audio:
+            self.pc.addTrack(player.audio)
+        if player.video:
+            self.pc.addTrack(player.video)
